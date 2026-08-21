@@ -178,7 +178,12 @@ var laminar = (function(module) {
 
         this._enabled = false;
         this._equivolume = true;
-        this._width = 1024;
+
+        // The panel is sampled pixelwise: one column per pixel across the
+        // view, one depth per pixel down it. These are only placeholders --
+        // _syncResolution() replaces them with the panel's real size as soon
+        // as it is on screen and keeps them there as it is resized.
+        this._width = 512;
         this._height = 128;
 
         // The ribbon: the same profile, standing in the volume instead of
@@ -232,6 +237,7 @@ var laminar = (function(module) {
 
         var root = $(viewer.object);
         this.panel = root.find("#laminar_panel");
+        this.plot = root.find("#laminar_plot");
         this.canvas = root.find("#laminar_canvas");
         this.message = root.find("#laminar_message");
         this.readout = root.find("#laminar_readout");
@@ -288,24 +294,30 @@ var laminar = (function(module) {
         this.setRibbonOnly(!this._ribbononly);
     };
 
-    module.Profile.prototype.setWidth = function(val) {
-        if (val === undefined)
-            return this._width;
-        val = Math.max(8, Math.round(val));
-        if (val === this._width)
+    /* The profile's resolution is the panel's resolution: the window defines
+     * how many pixels there are, and every one of them gets its own point in
+     * the volume. So the number of columns is the width of the view in device
+     * pixels and the number of depths is its height -- there is nothing to
+     * tune, resizing the panel is what changes the sampling. */
+    module.Profile.prototype._syncResolution = function() {
+        var canvas = this.canvas[0];
+        // Zero while the panel is still hidden; keep the last good size.
+        if (canvas.clientWidth === 0 || canvas.clientHeight === 0)
             return;
-        this._width = val;
-        this._makeGeometry();
-        this._dirty = true;
-        this.viewer.schedule();
-    };
 
-    module.Profile.prototype.setHeight = function(val) {
-        if (val === undefined)
-            return this._height;
-        this._height = Math.max(4, Math.round(val));
-        this._dirty = true;
-        this.viewer.schedule();
+        var dpr = window.devicePixelRatio || 1;
+        var W = Math.max(8, Math.round(canvas.clientWidth * dpr));
+        var H = Math.max(4, Math.round(canvas.clientHeight * dpr));
+
+        if (W !== this._width) {
+            this._width = W;
+            this._makeGeometry();
+            this._dirty = true;
+        }
+        if (H !== this._height) {
+            this._height = H;
+            this._dirty = true;
+        }
     };
 
     /*** surface plumbing ****************************************************/
@@ -1186,6 +1198,7 @@ var laminar = (function(module) {
         }
 
         this._updateLineTexture();
+        this._syncResolution();
 
         var sig = this._signature();
         if (this._dirty || !_sigequal(sig, this._sig)) {
@@ -1390,6 +1403,35 @@ var laminar = (function(module) {
         this.panel.css({left:pos.left, top:pos.top, right:"auto", bottom:"auto"});
         if ($.fn.draggable !== undefined)
             this.panel.draggable({handle:"#laminar_header", containment:"parent"});
+        if ($.fn.resizable !== undefined) {
+            // Dragging the corner anchor resizes the view, and since the view
+            // *is* the sampling grid (see _syncResolution) that is also how
+            // the profile's resolution is set.
+            this.panel.resizable({
+                handles: "se",
+                minWidth: 200,
+                minHeight: 120,
+                containment: "parent",
+                resize: function() {
+                    this._layoutPlot();
+                    this._dirty = true;
+                    this.viewer.schedule();
+                }.bind(this),
+            });
+        }
+    };
+
+    /* The panel's height is divided up by hand: everything but the plot keeps
+     * the height it asked for, and the plot takes what is left. */
+    module.Profile.prototype._layoutPlot = function() {
+        var h = this.panel.height();
+        var plot = this.plot[0];
+        this.panel.children().each(function() {
+            if (this !== plot && !$(this).hasClass("ui-resizable-handle"))
+                h -= $(this).outerHeight(true);
+        });
+        h -= this.plot.outerHeight(true) - this.plot.height();
+        this.plot.height(Math.max(24, h));
     };
 
     module.Profile.prototype._bindUI = function() {

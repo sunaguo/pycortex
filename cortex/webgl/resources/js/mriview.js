@@ -1353,8 +1353,6 @@ var mriview = (function(module) {
             equivolume: {action:[this.laminar, "setEquivolume"]},
             ribbon_only: {action:[this.laminar, "setRibbonOnly"]},
             ribbonToggle: {action: this.laminar.toggleRibbonOnly.bind(this.laminar), key:'b', hidden:true, help:'Show only the depth profile ribbon'},
-            samples: {action:[this.laminar, "setWidth", 64, 2048, 1]},
-            depths: {action:[this.laminar, "setHeight", 8, 512, 1]},
             reset_line: {action: this.laminar.resetLine.bind(this.laminar), help:'Reset profile line'},
         });
 
