@@ -181,6 +181,27 @@ var laminar = (function(module) {
         this._width = 1024;
         this._height = 128;
 
+        // The ribbon: the same profile, standing in the volume instead of
+        // unrolled into the panel. Only ever shown on the fully folded
+        // surface, where "pial" and "white matter" still mean something.
+        this._ribbononly = false;
+        this._ribbonGeom = null;
+        this._ribbonMesh = null;
+        this._ribbonShader = null;
+        this._ribbonKey = null;
+        this._ribbonHemi = null;    // whose cortex the ribbon's transform follows
+        this._ribbonVis = null;
+        this._colsok = false;
+
+        // The ribbon is drawn from its own scene rather than hung off the
+        // surface. Several passes (the SVG overlay's depth pre-pass, the
+        // picker) render the surface's scene with an overrideMaterial that
+        // expects the full set of surface attributes, and anything else parked
+        // in that graph crashes them. Drawing it ourselves, straight after the
+        // main render and without clearing, keeps it out of those passes while
+        // still sharing their depth buffer.
+        this.ribbonScene = new THREE.Scene();
+
         // Endpoints of the flatmap line, as {hemi, x, y} in the shared,
         // normalized flatmap space (see FlatIndex). `hemi` only records which
         // side the point landed on, for the readout.
@@ -255,6 +276,18 @@ var laminar = (function(module) {
         this.viewer.schedule();
     };
 
+    module.Profile.prototype.setRibbonOnly = function(val) {
+        if (val === undefined)
+            return this._ribbononly;
+        this._ribbononly = !!val;
+        this._updateRibbon();
+        this.viewer.schedule();
+    };
+
+    module.Profile.prototype.toggleRibbonOnly = function() {
+        this.setRibbonOnly(!this._ribbononly);
+    };
+
     module.Profile.prototype.setWidth = function(val) {
         if (val === undefined)
             return this._width;
@@ -319,6 +352,15 @@ var laminar = (function(module) {
 
     module.Profile.prototype._isFlat = function() {
         return this._flatness() > 0.999;
+    };
+
+    /* The ribbon only makes sense on the folded surface: the moment the brain
+     * starts unfolding, mixfunc() blends the cortical sheet towards a morph
+     * target and the pial/white matter separation the ribbon is made of stops
+     * being the thing on screen. */
+    module.Profile.prototype._isFolded = function() {
+        var surf = this._surface();
+        return surf !== null && surf.uniforms.surfmix.value <= 1e-6;
     };
 
     module.Profile.prototype._mesh = function(hemi) {
@@ -757,6 +799,206 @@ var laminar = (function(module) {
         return nvalid > 0;
     };
 
+    /*************************************************************************
+     * The ribbon
+     *
+     * The panel unrolls the profile into a rectangle. The ribbon is the same
+     * profile left where it came from: a strip standing perpendicular to the
+     * cortex, its outer edge the line on the pial surface, its inner edge the
+     * same line on the white matter surface, and the volume sampled straight
+     * through the middle.
+     *
+     * This is the one part of the depth profile that genuinely needs its own
+     * geometry -- there is no surface in the scene for those fragments to land
+     * on, so no amount of shader work on the cortex can produce them. It is
+     * cheap geometry though: the same W+1 columns _computeColumns() already
+     * resolved, two vertices each, and Shaders.laminar unchanged. Because the
+     * vertex position *is* the sampling point here, the fragment shader's
+     * mix(vPial, vWm, alpha) reproduces it exactly, and the equivolume
+     * reparameterization -- which only ever moves the panel's depth axis
+     * around -- is switched off: in the volume, position is the depth.
+     *************************************************************************/
+
+    module.Profile.prototype._makeRibbonGeometry = function() {
+        var n = this._width + 1;
+
+        if (this._ribbonMesh !== null)
+            this.ribbonScene.remove(this._ribbonMesh);
+        if (this._ribbonGeom !== null)
+            this._ribbonGeom.dispose();
+
+        var geom = new THREE.BufferGeometry();
+        // Row 0 is the pial edge, row 1 the white matter edge -- the same
+        // layout as the panel's mesh, so the columns copy across as runs.
+        geom.addAttribute("index", new THREE.BufferAttribute(new Uint16Array(this._width * 6), 1));
+        geom.addAttribute("position", new THREE.BufferAttribute(new Float32Array(n*2*3), 3));
+        geom.addAttribute("pialpos", new THREE.BufferAttribute(new Float32Array(n*2*3), 3));
+        geom.addAttribute("wmpos", new THREE.BufferAttribute(new Float32Array(n*2*3), 3));
+        geom.addAttribute("pialarea", new THREE.BufferAttribute(new Float32Array(n*2), 1));
+        geom.addAttribute("wmarea", new THREE.BufferAttribute(new Float32Array(n*2), 1));
+        geom.addAttribute("alpha", new THREE.BufferAttribute(new Float32Array(n*2), 1));
+        geom.addAttribute("valid", new THREE.BufferAttribute(new Float32Array(n*2), 1));
+        geom.dynamic = true;
+
+        var alpha = geom.attributes.alpha.array;
+        for (var i = 0; i < n; i++) {
+            alpha[i] = 0;
+            alpha[n+i] = 1;
+        }
+        this._ribbonGeom = geom;
+        this._ribbonMesh = new THREE.Mesh(geom, this._ribbonShader);
+        // The bounding box would have to be recomputed on every drag, and the
+        // ribbon is one strip; just always draw it.
+        this._ribbonMesh.frustumCulled = false;
+        this._ribbonMesh.visible = false;
+        // The transform is copied from the cortex every frame (see
+        // _cortexMesh), not derived from this object's own position.
+        this._ribbonMesh.matrixAutoUpdate = false;
+        this.ribbonScene.add(this._ribbonMesh);
+        this._ribbonVis = null;
+    };
+
+    /* Lift the columns the panel just resolved into the volume. */
+    module.Profile.prototype._updateRibbonGeometry = function() {
+        if (this._ribbonGeom === null || this._ribbonGeom.attributes.alpha.array.length !== (this._width+1)*2)
+            this._makeRibbonGeometry();
+
+        var W = this._width, n = W + 1;
+        var src = this.geometry.attributes, dst = this._ribbonGeom.attributes;
+
+        dst.pialpos.array.set(src.pialpos.array);
+        dst.wmpos.array.set(src.wmpos.array);
+        dst.pialarea.array.set(src.pialarea.array);
+        dst.wmarea.array.set(src.wmarea.array);
+        dst.valid.array.set(src.valid.array);
+
+        // Each vertex sits at its own end of the column, so the strip spans
+        // the cortex exactly and every fragment across it interpolates to the
+        // anatomical point the shader then samples.
+        var pos = dst.position.array;
+        pos.set(src.pialpos.array.subarray(0, n*3), 0);
+        pos.set(src.wmpos.array.subarray(n*3, n*2*3), n*3);
+
+        // Columns that fell off the flatmap carry no position at all, so the
+        // quads touching them collapse to degenerate triangles rather than
+        // letting the strip stretch to the origin. A line crossing the gap
+        // between the hemispheres comes out as two pieces.
+        var valid = src.valid.array;
+        var index = dst.index.array;
+        for (var i = 0; i < W; i++) {
+            if (valid[i] < 0.5 || valid[i+1] < 0.5) {
+                for (var k = 0; k < 6; k++)
+                    index[i*6+k] = 0;
+                continue;
+            }
+            index[i*6+0] = i;   index[i*6+1] = i + 1;     index[i*6+2] = n + i + 1;
+            index[i*6+3] = i;   index[i*6+4] = n + i + 1; index[i*6+5] = n + i;
+        }
+
+        // alpha is fixed by the row layout and never has to go back up.
+        var changed = ["index", "position", "pialpos", "wmpos", "pialarea", "wmarea", "valid"];
+        for (var k = 0; k < changed.length; k++)
+            dst[changed[k]].needsUpdate = true;
+    };
+
+    module.Profile.prototype._ensureRibbonShader = function() {
+        var dv = this.viewer.active;
+        var key = [dv.uuid, dv.filter, dv.data.length, dv.data[0].raw].join("|");
+        if (this._ribbonKey === key && this._ribbonShader !== null)
+            return this._ribbonShader;
+
+        if (this._ribbonShader !== null)
+            this._ribbonShader.dispose();
+
+        this._ribbonShader = dv.getShader(Shaders.laminar, {}, {
+            equivolume: false,
+            lights: false,
+            depthTest: true,
+            depthWrite: true,
+            transparent: false,
+        })[0];
+        // A cross section has two faces and both are worth looking at.
+        this._ribbonShader.side = THREE.DoubleSide;
+        this._ribbonKey = key;
+        if (this._ribbonMesh !== null)
+            this._ribbonMesh.material = this._ribbonShader;
+        return this._ribbonShader;
+    };
+
+    /* The cortex mesh whose transform the ribbon copies. Taking it from the
+     * mesh rather than its pivot picks up everything on the way down -- the
+     * pivot and shift controls, and the flatmap offset _makeMesh cancels out
+     * on the mesh itself. A line that crosses between the hemispheres follows
+     * the side it starts on; both sides share a transform until the pivot or
+     * shift controls are touched. */
+    module.Profile.prototype._cortexMesh = function() {
+        var surf = this._surface();
+        if (surf === null || this._ribbonHemi === null || surf.sheets.length === 0)
+            return null;
+        return surf.sheets[0][this._ribbonHemi] || null;
+    };
+
+    /* The ribbon stands in for the hemisphere it belongs to, so only that one
+     * gets out of the way -- the other side stays up as context. Pass null to
+     * put both back. */
+    module.Profile.prototype._hideCortex = function(hemi) {
+        var surf = this._surface();
+        if (surf === null)
+            return;
+        for (var i = 0; i < surf.sheets.length; i++) {
+            for (var h = 0; h < HEMIS.length; h++)
+                surf.sheets[i][HEMIS[h]].visible = HEMIS[h] !== hemi;
+        }
+    };
+
+    /* Decide, once per frame, whether the ribbon is up and its hemisphere down.
+     * _ondraw runs after the frame has been rendered, so a change here only
+     * lands on the next one -- ask for it when the answer moves. */
+    module.Profile.prototype._updateRibbon = function() {
+        var on = this._enabled && this._ribbononly && this._colsok &&
+                 this.endpoints !== null && this._isFolded() &&
+                 this._ribbonMesh !== null;
+
+        this._ribbonHemi = on ? this.endpoints[0].hemi : null;
+        if (this._ribbonMesh !== null)
+            this._ribbonMesh.visible = on;
+
+        // Keep asserting it while the ribbon is up -- setHalo rebuilds the
+        // sheets visible, and the line can be dragged onto the other
+        // hemisphere, which has to hand the first one back. On the way out it
+        // is set once rather than fought for every frame.
+        if (on)
+            this._hideCortex(this._ribbonHemi);
+        else if (this._ribbonVis)
+            this._hideCortex(null);
+
+        if (this._ribbonVis !== on) {
+            this._ribbonVis = on;
+            this.viewer.schedule();
+        }
+    };
+
+    /* Called by the viewer once the main scene is on screen. Nothing is
+     * cleared, so the ribbon lands in the frame the cortex just drew, depth
+     * buffer and all. */
+    module.Profile.prototype.drawRibbon = function(renderer, camera) {
+        if (this._ribbonMesh === null || !this._ribbonMesh.visible)
+            return;
+        var cortex = this._cortexMesh();
+        if (cortex === null)
+            return;
+
+        // The main render has already brought the surface's matrices up to
+        // date, so this is the transform the cortex was just drawn with. Our
+        // scene sits at the origin, so its world matrix is just this.
+        this._ribbonMesh.matrix.copy(cortex.matrixWorld);
+
+        var autoclear = renderer.autoClear;
+        renderer.autoClear = false;
+        renderer.render(this.ribbonScene, camera);
+        renderer.autoClear = autoclear;
+    };
+
     /*** rendering ***********************************************************/
 
     module.Profile.prototype._ensureShader = function() {
@@ -797,6 +1039,10 @@ var laminar = (function(module) {
         var viewer = this.viewer, dv = viewer.active;
         var surf = this._surface();
 
+        // The ribbon rides on the columns resolved below, so it is only ever
+        // as good as the last successful pass through here.
+        this._colsok = false;
+
         if (surf === null || surf.loaded.state() !== "resolved") {
             this._showMessage("Loading surfaces\u2026");
             return false;
@@ -821,6 +1067,9 @@ var laminar = (function(module) {
         }
         this._showMessage(null);
         this._ensureShader();
+        this._ensureRibbonShader();
+        this._updateRibbonGeometry();
+        this._colsok = true;
 
         var W = this._width, H = this._height;
         if (this._target === null || this._target.width !== W || this._target.height !== H) {
@@ -930,18 +1179,22 @@ var laminar = (function(module) {
             this.resetLine();      // no-op until the surfaces have loaded
 
         this._updateOverlay();
-        if (!this._enabled)
+        if (!this._enabled) {
+            this._colsok = false;
+            this._updateRibbon();
             return;
+        }
 
         this._updateLineTexture();
 
         var sig = this._signature();
-        if (!this._dirty && _sigequal(sig, this._sig))
-            return;
-        if (this.render()) {
-            this._sig = sig;
-            this._dirty = false;
+        if (this._dirty || !_sigequal(sig, this._sig)) {
+            if (this.render()) {
+                this._sig = sig;
+                this._dirty = false;
+            }
         }
+        this._updateRibbon();
     };
 
     module.Profile.prototype._onresize = function(evt) {

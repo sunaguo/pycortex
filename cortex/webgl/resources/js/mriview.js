@@ -149,6 +149,10 @@ var mriview = (function(module) {
             this.oculus.render(scene, this.camera);
         else
             this.renderer.render(scene, this.camera);
+
+        // The depth profile ribbon isn't part of the surface's scene (see
+        // laminar.js); it goes down on top of the frame, sharing its depth.
+        this.laminar.drawRibbon(this.renderer, this.camera);
     }
 
     module.Viewer.prototype.setOculus = function() {
@@ -1347,6 +1351,8 @@ var mriview = (function(module) {
             show: {action:[this.laminar, "setEnabled"]},
             showToggle: {action: this.laminar.toggle.bind(this.laminar), key:'j', hidden:true, help:'Toggle depth profile'},
             equivolume: {action:[this.laminar, "setEquivolume"]},
+            ribbon_only: {action:[this.laminar, "setRibbonOnly"]},
+            ribbonToggle: {action: this.laminar.toggleRibbonOnly.bind(this.laminar), key:'b', hidden:true, help:'Show only the depth profile ribbon'},
             samples: {action:[this.laminar, "setWidth", 64, 2048, 1]},
             depths: {action:[this.laminar, "setHeight", 8, 512, 1]},
             reset_line: {action: this.laminar.resetLine.bind(this.laminar), help:'Reset profile line'},
